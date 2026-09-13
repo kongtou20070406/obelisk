@@ -119,29 +119,36 @@ interface ReadLinesOptions {
 
 function readLines(
   filePath: string,
-  callback: (line: string, terminated: boolean) => boolean | void,
+  callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
   { start = 0 }: ReadLinesOptions = {},
 ): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
   const buf = Buffer.alloc(bufSize);
-  let remainder = '';
+  let remainder = Buffer.alloc(0);
   let bytesRead;
   let position = start;
   try {
     while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      const chunkStart = position;
       position += bytesRead;
-      const lines = buf.toString('utf8', 0, bytesRead).split('\n');
-      lines[0] = remainder + lines[0];
-      remainder = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line && callback(line, true) === false) return;
+      const chunk = buf.subarray(0, bytesRead);
+      const combinedStart = chunkStart - remainder.length;
+      const data = remainder.length === 0 ? chunk : Buffer.concat([remainder, chunk]);
+      let lineStart = 0;
+      while (true) {
+        const newline = data.indexOf(0x0a, lineStart);
+        if (newline < 0) break;
+        const line = data.toString('utf8', lineStart, newline);
+        lineStart = newline + 1;
+        if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
+      remainder = data.subarray(lineStart).slice();
     }
     // `terminated: false` — the final chunk had no trailing newline, so this
     // tail may still be growing (or may simply be an unterminated last line;
     // the caller cannot tell, and must decide what that means).
-    if (remainder) callback(remainder, false);
+    if (remainder.length > 0) callback(remainder.toString('utf8'), false);
   } finally {
     closeSync(fd);
   }

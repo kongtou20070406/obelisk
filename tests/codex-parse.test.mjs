@@ -81,6 +81,33 @@ test('codex parse() yields a deduped, tool-aware record stream with a total sess
   assert.equal(sessions[0].git_branch, 'main');
 });
 
+test('codex v4 checkpoint resumes a cooperative append from its byte offset', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: '中文 😀 before offset' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  const state = cursorState(first.ret);
+  assert.equal(state.v, 4);
+  assert.equal(typeof state.completeLineOffset, 'number');
+  assert.equal(state.completeLineOffset, first.ret.split(':')[2] * 1);
+  assert.equal(state.sourceSize, state.completeLineOffset);
+  assert.equal(typeof state.dev, 'string');
+  assert.equal(typeof state.sourceInode, 'string');
+
+  const unchanged = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(unchanged.values, [], 'an empty suffix emits no patch');
+  assert.equal(unchanged.ret, first.ret, 'an empty suffix does not advance the checkpoint');
+
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'after offset' },
+  })}\n`);
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['after offset']);
+  assert.equal(second.values.some(record => record.kind === 'delete-session'), false);
+  assert.equal(cursorState(second.ret).verifiedPrefix, false);
+});
+
 test('codex parse() resumes a verified append without replaying old records', () => {
   const path = writeFixture([
     { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
@@ -115,23 +142,29 @@ test('codex parse() resumes a verified append without replaying old records', ()
   assert.equal(session.message_count, 4, 'the session record remains an authoritative total');
 });
 
-test('codex parse() falls back when an unterminated tail is completed', () => {
-  const path = writeFixture([]);
-  const prefix = [
+test('codex parse() does not advance a partial tail and falls back once it is completed', () => {
+  const path = writeFixture([
     { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
-    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'partial tail' } },
-  ];
-  writeFileSync(path, prefix.map(line => JSON.stringify(line)).join('\n'));
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'complete prefix' } },
+  ]);
   const first = drain(parse({ key: path, sessionId: '' }, null));
-  appendFileSync(path, '\n' + JSON.stringify({
-    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'completed tail' },
-  }) + '\n');
+  const partial = JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'partial tail' },
+  });
+  appendFileSync(path, partial);
 
   const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(second.values, [], 'an unterminated suffix emits no patch');
+  assert.equal(second.ret, first.ret, 'the checkpoint stays before the partial line');
+
+  appendFileSync(path, '\n' + JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'agent_message', message: 'completed tail' },
+  }) + '\n');
+  const third = drain(parse({ key: path, sessionId: '' }, first.ret));
   assert.deepEqual(
-    second.values.filter(record => record.kind === 'message').map(record => record.text),
+    third.values.filter(record => record.kind === 'message').map(record => record.text),
     ['partial tail', 'completed tail'],
-    'the completed prior line forces a complete snapshot instead of an unsafe byte seek',
+    'completion of a partial suffix forces a full replay instead of an unsafe byte seek',
   );
 });
 
