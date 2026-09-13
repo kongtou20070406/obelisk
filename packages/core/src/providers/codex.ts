@@ -44,7 +44,6 @@ const CODEX_SESSIONS_DIR = 'sessions';
 const CODEX_ARCHIVED_SESSIONS_DIR = 'archived_sessions';
 
 const HIDDEN_CONTEXT_ENVELOPE_RE = /^\s*<(environment_context|codex_internal_context)\b[^>]*>[\s\S]*<\/\1>\s*$/;
-const CODEX_SCAN_HINT_RE = /"(?:session_meta|event_msg|function_call|custom_tool_call|tool_search_call|web_search_call|codex-auto-review)"/;
 
 function messageVisibility(role: string, text: string | null): 'visible' | 'hidden' {
   return role === 'user' && typeof text === 'string' && HIDDEN_CONTEXT_ENVELOPE_RE.test(text)
@@ -119,14 +118,33 @@ function discoverAt(rootDir: string, ctx: DiscoverContext): IndexUnit[] {
       const fileChanged = changedFiles.has(normalize(file.path));
       if (ctx.changedPaths !== undefined && !sessionIndexChanged && !fileChanged) return [];
       const cursor = ctx.lastCursor(file.path);
+      const unchangedSource = cursor !== null && !codexCursorSignatureDiffers(cursor, file.path);
+      // A session-index-only refresh must update the aggregate, but a
+      // strengthened cursor already contains the identity needed to construct
+      // the normal-session unit. Avoid reopening every historical rollout for
+      // guardian classification when its source signature is unchanged.
+      if (sessionIndexChanged && !fileChanged && unchangedSource) {
+        const checkpoint = decodeCodexCursor(cursor);
+        if (checkpoint !== null) {
+          const parentId = codexParentThreadId(checkpoint.meta);
+          const indexed = sessionIndex.get(checkpoint.threadRawId);
+          return [{
+            key: file.path,
+            sessionId: codexDbId(parentId || checkpoint.threadRawId) ?? '',
+            meta: {
+              source: 'codex', guardian: false,
+              indexedTitle: indexed?.title,
+              indexedUpdatedAt: indexed?.updatedAt,
+            },
+          }];
+        }
+      }
       // Skip unchanged files before paying for guardian detection: guardian
       // status is content-derived, so a file whose cursor signature still
       // matches cannot have changed status. Pre-v3 databases may still hold
       // guardian session rows; the v3 marker bump forces one full replay that
       // retracts them.
-      if (!sessionIndexChanged && !fileChanged && cursor !== null && !codexCursorSignatureDiffers(cursor, file.path)) {
-        return [];
-      }
+      if (!sessionIndexChanged && !fileChanged && unchangedSource) return [];
       const guardian = readCodexGuardianThreadInfo(file.path);
       let meta: any = null;
       readLines(file.path, (line: string) => {
@@ -181,6 +199,8 @@ interface CodexCursorState {
   sourceInode?: string;
   verifiedPrefix?: boolean;
   stateComplete?: boolean;
+  indexedTitle?: string;
+  indexedUpdatedAt?: string | null;
   chunkHashes: string[];
   eventMessageBloom: string;
   responseMessageBloom: string;
@@ -205,8 +225,6 @@ interface DecodedCodexCursor extends CodexCursorState {
   size: number;
   ctimeMs: number;
   inode: number;
-  completeLineOffset: number;
-  dev: string;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {
@@ -336,6 +354,8 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || (value.sourceInode !== undefined && typeof value.sourceInode !== 'string')
       || (value.verifiedPrefix !== undefined && typeof value.verifiedPrefix !== 'boolean')
       || (value.stateComplete !== undefined && typeof value.stateComplete !== 'boolean')
+      || (value.indexedTitle !== undefined && typeof value.indexedTitle !== 'string')
+      || (value.indexedUpdatedAt !== undefined && !nullableString(value.indexedUpdatedAt))
       || !Array.isArray(value.chunkHashes)
       || value.chunkHashes.length > CODEX_MAX_CURSOR_CHUNK_HASHES
       || !value.chunkHashes.every(item => typeof item === 'string')
@@ -359,15 +379,14 @@ function decodeCodexCursor(cursor: Cursor): DecodedCodexCursor | null {
       || !Number.isFinite(value.totalOutputTokens)) {
       return null;
     }
-    if (value.completeLineOffset === undefined || value.dev === undefined) return null;
+    // Keep #148 v4 cursors readable. They simply lack the strengthened offset
+    // identity and therefore cannot enter cooperative mode.
     return {
       ...(value as unknown as CodexCursorState),
       lineCount,
       size,
       ctimeMs,
       inode,
-      completeLineOffset: value.completeLineOffset,
-      dev: value.dev,
     };
   } catch {
     return null;
@@ -466,6 +485,11 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   // seek to the suffix without reading the old prefix. Any failed gate falls
   // through to #148's fingerprinted verification/snapshot behavior.
   const cooperativeCandidate = prior !== null
+    && prior.completeLineOffset !== undefined
+    && prior.sourceSize !== undefined
+    && prior.dev !== undefined
+    && prior.sourceInode !== undefined
+    && prior.stateComplete !== false
     && prior.threadRawId === codexRawId(prior.meta.id)
     && prior.dev === String(stat.dev)
     && prior.sourceInode === String(stat.ino)
@@ -473,13 +497,41 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     && prior.terminated
     && prior.completeLineOffset === prior.size
     && prior.sourceSize === prior.size
-    && prior.stateComplete !== false
     && stat.size >= prior.completeLineOffset;
   // Growth is the normal append signal; ctime necessarily changes when bytes
   // are appended. For same-size sources, require the unchanged ctime before
   // treating the file as a no-op, otherwise let fingerprinting detect rewrites.
   const sameCheckpoint = cooperativeCandidate && stat.size === prior.size;
-  if (sameCheckpoint && stat.ctimeMs === prior.ctimeMs) return _cursor;
+  const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
+  const metadataChanged = sameCheckpoint && (
+    prior.indexedTitle !== indexedMeta?.indexedTitle
+    || prior.indexedUpdatedAt !== (indexedMeta?.indexedUpdatedAt ?? undefined)
+  );
+  if (sameCheckpoint && stat.ctimeMs === prior.ctimeMs) {
+    if (!metadataChanged) return _cursor;
+    const parentRawId = codexParentThreadId(prior.meta);
+    // A child has no independent session aggregate to patch. It must be
+    // re-planned with the parent projection rather than replace its parent.
+    if (parentRawId) return _cursor;
+    const endedAt = indexedMeta?.indexedUpdatedAt && (!prior.endedAt || indexedMeta.indexedUpdatedAt > prior.endedAt)
+      ? indexedMeta.indexedUpdatedAt
+      : prior.endedAt;
+    yield {
+      kind: 'session', id: codexDbId(prior.threadRawId) as string,
+      title: prior.threadTitle ?? indexedMeta?.indexedTitle ?? null,
+      project: projectSlugFromPath(normalizeObservedCwd(prior.meta.cwd)),
+      started_at: prior.startedAt, ended_at: endedAt, git_branch: prior.gitBranch,
+      version: prior.version, message_count: prior.messageCount, countMode: 'total',
+      jsonl_path: unit.key, source: 'codex',
+    };
+    const { lineCount, size, ctimeMs: _ctimeMs, inode: _inode, ...state } = prior;
+    return encodeCodexCursor(stat, lineCount, size, {
+      ...state,
+      indexedTitle: indexedMeta?.indexedTitle,
+      indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
+      endedAt,
+    });
+  }
   const cooperativeAppend = cooperativeCandidate && stat.size > prior.size;
   const fingerprint = cooperativeAppend
     ? {
@@ -498,41 +550,37 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     && prior.sourceInode === String(stat.ino)
     && prior.inode === stat.ino
     && prior.terminated
+    && prior.stateComplete !== false
+    && prior.completeLineOffset !== undefined
     && prior.completeLineOffset === prior.size
     && fingerprint.prefixMatches);
   const eventMessageKeys = new Set<string>();
   const appendedEventMessageKeys = new Set<string>();
   const appendedResponseMessageKeys = new Set<string>();
-  let lineNum = appendCandidate ? prior.lineCount : 0;
-  let completeLineCount = appendCandidate ? prior.lineCount : 0;
-  let completeLineOffset = appendCandidate ? prior.completeLineOffset : 0;
-  let terminated = appendCandidate ? prior.terminated : true;
-  let invalidSuffix = false;
   let metaRecord: { lineNum: number; obj: any } | null = !appendCandidate
     ? null
     : { lineNum: 1, obj: { timestamp: prior.startedAt, payload: prior.meta } };
   let sawAutoReviewModel = false;
   const scan = (start: number, collectAppendedResponses: boolean): {
-    lineCount: number; completeLineCount: number; completeLineOffset: number; terminated: boolean;
+    lineCount: number; completeLineCount: number; completeLineOffset: number; terminated: boolean; malformed: boolean;
   } => {
     let scannedLineNum = start === 0 ? 0 : (appendCandidate ? prior!.lineCount : 0);
     let scannedCompleteLineCount = start === 0 ? 0 : (appendCandidate ? prior!.lineCount : 0);
-    let scannedCompleteLineOffset = start === 0 ? 0 : (appendCandidate ? prior!.completeLineOffset : 0);
+    let scannedCompleteLineOffset = start === 0 ? 0 : (appendCandidate ? prior!.completeLineOffset! : 0);
     let scannedTerminated = start === 0 ? true : (appendCandidate ? prior!.terminated : true);
+    let malformed = false;
     readLines(unit.key, (line: string, lineTerminated: boolean, endOffset?: number) => {
       scannedTerminated = lineTerminated;
       if (!lineTerminated) return;
       scannedLineNum++;
       scannedCompleteLineCount++;
       if (endOffset !== undefined) scannedCompleteLineOffset = endOffset;
-      // Full snapshots can skip unrelated JSON during dedup/link discovery;
-      // append tails are parsed once here so both sides of a boundary duplicate
-      // are known before any records are emitted.
-      const head = line.length > 1024 ? line.slice(0, 1024) : line;
-      if (!collectAppendedResponses && !CODEX_SCAN_HINT_RE.test(head)) return;
+      // Parse every completed record before emitting anything. A malformed
+      // complete JSONL line is not a partial tail and must not publish a
+      // replacement assembled from only a source prefix.
       let obj: any;
       try { obj = JSON.parse(line); } catch {
-        if (collectAppendedResponses) invalidSuffix = true;
+        malformed = true;
         return;
       }
       if (metaRecord === null && obj?.type === 'session_meta' && obj.payload?.id) {
@@ -561,19 +609,17 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       completeLineCount: scannedCompleteLineCount,
       completeLineOffset: scannedCompleteLineOffset,
       terminated: scannedTerminated,
+      malformed,
     };
   };
-  const firstScan = scan(appendCandidate ? prior.size : 0, appendCandidate);
-  lineNum = firstScan.lineCount;
-  completeLineCount = firstScan.completeLineCount;
-  completeLineOffset = firstScan.completeLineOffset;
-  terminated = firstScan.terminated;
+  let scanResult = scan(appendCandidate ? prior.size : 0, appendCandidate);
   const afterScan = statSync(unit.key);
-  if (!sameStat(stat, afterScan)) return _cursor;
-  if (appendCandidate && (afterScan.size < prior!.size || completeLineOffset < prior!.completeLineOffset)) return _cursor;
+  if (!sameStat(stat, afterScan) || scanResult.malformed) return _cursor;
+  const priorCompleteLineOffset = appendCandidate ? prior!.completeLineOffset! : null;
+  if (priorCompleteLineOffset !== null && (afterScan.size < prior!.size || scanResult.completeLineOffset < priorCompleteLineOffset)) return _cursor;
   // Bytes without a final newline are not a consumable append. Keep the old
   // cursor and emit no aggregate so the next pass re-reads that partial line.
-  if (appendCandidate && completeLineOffset === prior!.completeLineOffset) return _cursor;
+  if (priorCompleteLineOffset !== null && scanResult.completeLineOffset === priorCompleteLineOffset) return _cursor;
   const priorEventBloom = appendCandidate ? decodeBloom(prior.eventMessageBloom)! : emptyBloom();
   const priorResponseBloom = appendCandidate ? decodeBloom(prior.responseMessageBloom)! : emptyBloom();
   // Bloom filters have no false negatives. A possible cross-boundary duplicate
@@ -583,23 +629,15 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     [...appendedEventMessageKeys].some(key => bloomMightContain(priorResponseBloom, key))
       || [...appendedResponseMessageKeys].some(key => bloomMightContain(priorEventBloom, key))
   );
-  const fast = appendCandidate && !possibleCrossBoundaryDuplicate && !invalidSuffix;
+  const fast = appendCandidate && !possibleCrossBoundaryDuplicate;
   if (appendCandidate && !fast) {
     eventMessageKeys.clear();
-    invalidSuffix = false;
-    lineNum = 0;
-    completeLineCount = 0;
-    completeLineOffset = 0;
-    terminated = true;
     metaRecord = null;
     sawAutoReviewModel = false;
-    const replayScan = scan(0, false);
-    lineNum = replayScan.lineCount;
-    completeLineCount = replayScan.completeLineCount;
-    completeLineOffset = replayScan.completeLineOffset;
-    terminated = replayScan.terminated;
-    if (!sameStat(stat, statSync(unit.key))) return _cursor;
+    scanResult = scan(0, false);
+    if (!sameStat(stat, statSync(unit.key)) || scanResult.malformed) return _cursor;
   }
+  const { lineCount: lineNum, completeLineCount, completeLineOffset, terminated } = scanResult;
   const eventMessageBloom = fast ? priorEventBloom : emptyBloom();
   const responseMessageBloom = fast ? priorResponseBloom : emptyBloom();
   for (const key of eventMessageKeys) bloomAdd(eventMessageBloom, key);
@@ -644,7 +682,6 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
   if (canRetract) out.push({ kind: 'delete-session', sessionId });
   const msgByUuid = new Map<string, MessageRecord>();
   const emittedMessageUuids = new Set<string>();
-  const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
   const initialTimestamp = (meta.timestamp || capturedMeta.obj.timestamp || null) as string | null;
   const indexedUpdatedAt = indexedMeta?.indexedUpdatedAt ?? null;
   const sm = {
@@ -838,6 +875,8 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     sourceInode: String(stat.ino),
     verifiedPrefix: !cooperativeCandidate && fingerprint.prefixMatches && fingerprint.complete,
     stateComplete,
+    indexedTitle: indexedMeta?.indexedTitle,
+    indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
     chunkHashes: fingerprint.chunkHashes,
     eventMessageBloom: eventMessageBloom.toString('base64url'),
     responseMessageBloom: responseMessageBloom.toString('base64url'),

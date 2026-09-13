@@ -143,7 +143,9 @@ function readLines(
         lineStart = newline + 1;
         if (line && callback(line, true, combinedStart + lineStart) === false) return;
       }
-      remainder = data.subarray(lineStart).slice();
+      // `buf` is reused by the next readSync; retain an owned copy so a line
+      // spanning chunks is never overwritten before it is completed.
+      remainder = Buffer.from(data.subarray(lineStart));
     }
     // `terminated: false` — the final chunk had no trailing newline, so this
     // tail may still be growing (or may simply be an unterminated last line;
