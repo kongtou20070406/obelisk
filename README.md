@@ -259,7 +259,7 @@ packaging/                    # Skill publish infrastructure
 SKILL.md                      # Remote one-time CLI + skill bootstrap guide
 install.sh                    # POSIX CLI-only installer
 CONTEXT.md                    # Project glossary
-docs/adr/                     # Architecture decision records (0001–0006)
+docs/adr/                     # Architecture decision records (0001–0013)
 ```
 
 The optional `/obelisk recap` flow is loaded only for explicit `/obelisk recap` intent.
