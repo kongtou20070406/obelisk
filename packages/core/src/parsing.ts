@@ -262,11 +262,15 @@ function codexParentThreadId(meta: JsonRecord): string | null {
     || null;
 }
 
+// Legacy guardian threads surface as records from the internal auto-review
+// model rather than as explicit subagent metadata.
+const CODEX_AUTO_REVIEW_MODEL = 'codex-auto-review';
+
 function codexIsGuardianThread(meta: JsonRecord, records: CodexLineRecord[] = []): boolean {
   const subagent = meta?.source?.subagent;
   if (subagent?.other === 'guardian') return true;
   if (meta?.thread_source !== 'subagent') return false;
-  return records.some(({ obj }) => obj?.payload?.model === 'codex-auto-review' || obj?.model === 'codex-auto-review');
+  return records.some(({ obj }) => obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL || obj?.model === CODEX_AUTO_REVIEW_MODEL);
 }
 
 function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; lineNum: number } | null {
@@ -282,8 +286,8 @@ function readCodexGuardianThreadInfo(filePath: string): { threadRawId: string; l
     } catch {
       return;
     }
-    sawAutoReviewModel ||= obj?.payload?.model === 'codex-auto-review'
-      || obj?.model === 'codex-auto-review';
+    sawAutoReviewModel ||= obj?.payload?.model === CODEX_AUTO_REVIEW_MODEL
+      || obj?.model === CODEX_AUTO_REVIEW_MODEL;
     if (obj?.type === 'session_meta' && obj.payload?.id) {
       metaRecord = { lineNum, obj };
       if (obj.payload?.source?.subagent?.other === 'guardian') {
