@@ -331,9 +331,13 @@ function createQueryApi(
       session_id=$sessionId AND uuid!=$messageUuid ${metaClause}
         AND ${visibilitySql('messages', includeInactive)}
     `;
-    // All provider timestamps are normalized ISO-8601 strings, so their text
-    // order is chronological. Pull at most six candidates from each side via
-    // idx_messages_ts, then preserve the old JULIANDAY distance ordering.
+    // Correctness relies on an ingest-convention invariant: every timestamp in
+    // the session is canonical YYYY-MM-DDTHH:mm:ss.sssZ, so text order is
+    // chronological. pi/kimi/deepseek normalize via toISOString(); claude and
+    // codex pass provider strings through, which are canonical in practice.
+    // Only the hit's own format is verified (below); neighbor rows are
+    // trusted. Pull at most six candidates from each side via idx_messages_ts,
+    // then preserve the old JULIANDAY distance ordering.
     const indexedContext = db.prepare(`
       WITH
         null_rows AS (
