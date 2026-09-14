@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
+import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 function writeFixture(lines) {
@@ -132,6 +132,22 @@ test('codex parse() accepts a legacy #148 v4 cursor but replays it conservativel
   assert.equal(typeof cursorState(second.ret).completeLineOffset, 'number');
 });
 
+test('codex strict read mode disables cooperative append', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'strict prefix' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'strict suffix' },
+  })}\n`);
+  const metrics = createCodexParseMetrics();
+  const second = drain(parse({ key: path, sessionId: '', meta: { readMode: 'strict' } }, first.ret, metrics));
+  assert.equal(metrics.plan, 'verified-append');
+  assert.ok(metrics.sourceBytesRead > Buffer.byteLength('\n'), 'strict mode verifies the existing prefix');
+  assert.deepEqual(second.values.filter(record => record.kind === 'message').map(record => record.text), ['strict suffix']);
+});
+
 test('codex parse() resumes a verified append without replaying old records', () => {
   const path = writeFixture([
     { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
@@ -186,6 +202,52 @@ test('codex parse() snapshots an incomplete continuation before linking a later 
   const result = second.values.find(record => record.kind === 'tool_result');
   assert.equal(result?.message_uuid, `codex:${META.id}:000002`, 'snapshot rebuild restores the prior call association');
   assert.ok(second.values.some(record => record.kind === 'delete-session'), 'the incomplete continuation does not emit an incremental patch');
+});
+
+test('codex parse() preserves an output whose source has no matching call', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'response_item', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'function_call_output', call_id: 'missing', output: 'orphan' } },
+  ]);
+  const { values } = drain(parse({ key: path, sessionId: '' }, null));
+  const result = values.find(record => record.kind === 'tool_result');
+  assert.equal(result?.message_uuid, '');
+});
+
+test('codex parse() does not publish a source mutated before pre-scan', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'stable prefix' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'first suffix view' },
+  })}\n`);
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret, undefined, {
+    beforeScan: () => appendFileSync(path, `${JSON.stringify({
+      type: 'event_msg', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'agent_message', message: 'concurrent mutation' },
+    })}\n`),
+  }));
+  assert.deepEqual(second.values, []);
+  assert.equal(second.ret, first.ret);
+});
+
+test('codex parse() does not publish a suffix mutated after pre-scan', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'stable prefix' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  appendFileSync(path, `${JSON.stringify({
+    type: 'event_msg', timestamp: '2026-06-10T10:00:02Z', payload: { type: 'agent_message', message: 'first suffix view' },
+  })}\n`);
+  const second = drain(parse({ key: path, sessionId: '' }, first.ret, undefined, {
+    afterScan: () => appendFileSync(path, `${JSON.stringify({
+      type: 'event_msg', timestamp: '2026-06-10T10:00:03Z', payload: { type: 'agent_message', message: 'concurrent mutation' },
+    })}\n`),
+  }));
+  assert.deepEqual(second.values, []);
+  assert.equal(second.ret, first.ret);
 });
 
 test('codex parse() rejects a malformed complete line without advancing its cursor', () => {

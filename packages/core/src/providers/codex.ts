@@ -227,6 +227,25 @@ interface DecodedCodexCursor extends CodexCursorState {
   inode: number;
 }
 
+/** Test/benchmark-only observation of source work for one parse invocation. */
+export interface CodexParseMetrics {
+  sourceBytesRead: number;
+  suffixBytesRead: number;
+  jsonLinesParsed: number;
+  emittedRecords: number;
+  plan: 'snapshot' | 'verified-append' | 'cooperative-append' | 'noop' | null;
+}
+
+export function createCodexParseMetrics(): CodexParseMetrics {
+  return { sourceBytesRead: 0, suffixBytesRead: 0, jsonLinesParsed: 0, emittedRecords: 0, plan: null };
+}
+
+/** Deterministic test seam for source mutation checks; never used by production callers. */
+export interface CodexParseTestHooks {
+  beforeScan?(): void;
+  afterScan?(): void;
+}
+
 function isRecord(value: unknown): value is Record<string, any> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -404,7 +423,11 @@ function encodeCodexCursor(
 }
 
 function sameStat(a: Stats, b: Stats): boolean {
-  return a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs && a.size === b.size && a.ino === b.ino;
+  return a.dev === b.dev
+    && a.mtimeMs === b.mtimeMs
+    && a.ctimeMs === b.ctimeMs
+    && a.size === b.size
+    && a.ino === b.ino;
 }
 
 function sameSource(a: Stats, b: Stats): boolean {
@@ -423,6 +446,7 @@ function fingerprintCodexFile(
   filePath: string,
   size: number,
   prior: DecodedCodexCursor | null,
+  metrics?: CodexParseMetrics,
 ): { chunkHashes: string[]; prefixMatches: boolean; bytesRead: number; complete: boolean } {
   const fd = openSync(filePath, 'r');
   const buffer = Buffer.allocUnsafe(CODEX_FINGERPRINT_CHUNK_BYTES);
@@ -445,6 +469,7 @@ function fingerprintCodexFile(
         const count = readSync(fd, buffer, filled, wanted - filled, position + filled);
         if (count === 0) break;
         filled += count;
+        if (metrics) metrics.sourceBytesRead += count;
       }
       if (filled === 0) break;
       const index = chunkHashes.length;
@@ -476,15 +501,25 @@ function fingerprintCodexFile(
   };
 }
 
-export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRecord, Cursor> {
+export function* parse(
+  unit: IndexUnit,
+  _cursor: Cursor,
+  metrics?: CodexParseMetrics,
+  testHooks?: CodexParseTestHooks,
+): Generator<TranscriptRecord, Cursor> {
   const stat = statSync(unit.key);
-  if (!usableSourceIdentity(stat)) return _cursor;
   const prior = decodeCodexCursor(_cursor);
+  const readMode = unit.meta && typeof unit.meta === 'object' && 'readMode' in unit.meta
+    && (unit.meta as { readMode?: unknown }).readMode === 'strict'
+    ? 'strict'
+    : 'normal';
   // The cooperative path deliberately trusts Codex's normal append-only writer:
   // same device/inode, a complete-line checkpoint, and monotonic growth let us
   // seek to the suffix without reading the old prefix. Any failed gate falls
   // through to #148's fingerprinted verification/snapshot behavior.
-  const cooperativeCandidate = prior !== null
+  const cooperativeCandidate = readMode === 'normal'
+    && prior !== null
+    && usableSourceIdentity(stat)
     && prior.completeLineOffset !== undefined
     && prior.sourceSize !== undefined
     && prior.dev !== undefined
@@ -508,7 +543,10 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     || prior.indexedUpdatedAt !== (indexedMeta?.indexedUpdatedAt ?? undefined)
   );
   if (sameCheckpoint && stat.ctimeMs === prior.ctimeMs) {
-    if (!metadataChanged) return _cursor;
+    if (!metadataChanged) {
+      if (metrics) metrics.plan = 'noop';
+      return _cursor;
+    }
     const parentRawId = codexParentThreadId(prior.meta);
     // A child has no independent session aggregate to patch. It must be
     // re-planned with the parent projection rather than replace its parent.
@@ -540,11 +578,12 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       bytesRead: 0,
       complete: stat.size <= CODEX_MAX_CURSOR_CHUNK_HASHES * CODEX_FINGERPRINT_CHUNK_BYTES,
     }
-    : fingerprintCodexFile(unit.key, stat.size, prior);
+    : fingerprintCodexFile(unit.key, stat.size, prior, metrics);
   const afterFingerprint = statSync(unit.key);
   if ((!cooperativeAppend && (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)))
     || (cooperativeAppend && !sameSource(stat, afterFingerprint))) return _cursor;
   const appendCandidate = cooperativeAppend || (prior !== null
+    && prior.verifiedPrefix === true
     && prior.threadRawId === codexRawId(prior.meta.id)
     && prior.dev === String(stat.dev)
     && prior.sourceInode === String(stat.ino)
@@ -579,7 +618,10 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       // complete JSONL line is not a partial tail and must not publish a
       // replacement assembled from only a source prefix.
       let obj: any;
-      try { obj = JSON.parse(line); } catch {
+      try {
+        obj = JSON.parse(line);
+        if (metrics) metrics.jsonLinesParsed++;
+      } catch {
         malformed = true;
         return;
       }
@@ -603,7 +645,15 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
         const text = codexMessagePayloadText(payload);
         if (text !== null) appendedResponseMessageKeys.add(visibleMessageDigest(payload.role || 'assistant', text));
       }
-    }, { start });
+    }, {
+      start,
+      onBytesRead: (bytes) => {
+        if (metrics) {
+          metrics.sourceBytesRead += bytes;
+          if (start > 0) metrics.suffixBytesRead += bytes;
+        }
+      },
+    });
     return {
       lineCount: scannedLineNum,
       completeLineCount: scannedCompleteLineCount,
@@ -612,7 +662,9 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       malformed,
     };
   };
+  testHooks?.beforeScan?.();
   let scanResult = scan(appendCandidate ? prior.size : 0, appendCandidate);
+  testHooks?.afterScan?.();
   const afterScan = statSync(unit.key);
   if (!sameStat(stat, afterScan) || scanResult.malformed) return _cursor;
   const priorCompleteLineOffset = appendCandidate ? prior!.completeLineOffset! : null;
@@ -630,6 +682,9 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
       || [...appendedResponseMessageKeys].some(key => bloomMightContain(priorEventBloom, key))
   );
   const fast = appendCandidate && !possibleCrossBoundaryDuplicate;
+  if (metrics) metrics.plan = fast
+    ? (cooperativeAppend ? 'cooperative-append' : 'verified-append')
+    : 'snapshot';
   if (appendCandidate && !fast) {
     eventMessageKeys.clear();
     metaRecord = null;
@@ -830,17 +885,33 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     }
     if (['function_call_output', 'custom_tool_call_output', 'tool_search_output'].includes(payload.type) && payload.call_id) {
       const toolId = codexCallId(threadRawId, payload.call_id) as string;
-      out.push({ kind: 'tool_result', tool_use_id: toolId, message_uuid: callMessageUuids.get(toolId) || '', session_id: sessionId, content: trunc(codexToolOutput(payload) || ''), file_path: null, is_error: payload.is_error ? 1 : 0 });
+      const messageUuid = callMessageUuids.get(toolId) || '';
+      // Preserve the source result even when malformed input has no matching
+      // call. An empty anchor is explicit evidence of the missing association;
+      // silently dropping the source record would create a timeline hole.
+      out.push({ kind: 'tool_result', tool_use_id: toolId, message_uuid: messageUuid, session_id: sessionId, content: trunc(codexToolOutput(payload) || ''), file_path: null, is_error: payload.is_error ? 1 : 0 });
       openCallMessageUuids.delete(toolId);
     }
   };
 
   let currentLine = fast ? prior!.lineCount : 0;
+  const emitStart = fast ? prior!.size : 0;
   readLines(unit.key, (line: string, lineTerminated: boolean) => {
     if (!lineTerminated) return;
     currentLine++;
-    try { processRecord(currentLine, JSON.parse(line)); } catch { /* skip malformed */ }
-  }, { start: fast ? prior!.size : 0 });
+    try {
+      processRecord(currentLine, JSON.parse(line));
+      if (metrics) metrics.jsonLinesParsed++;
+    } catch { /* pre-scan already rejected malformed complete lines */ }
+  }, {
+    start: emitStart,
+    onBytesRead: (bytes) => {
+      if (metrics) {
+        metrics.sourceBytesRead += bytes;
+        if (emitStart > 0) metrics.suffixBytesRead += bytes;
+      }
+    },
+  });
   const afterParse = statSync(unit.key);
   // `out` is only a staging buffer. If the source changed during the second
   // pass, abandon before adding aggregates or yielding anything; returning an
@@ -873,7 +944,12 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     sourceSize: stat.size,
     dev: String(stat.dev),
     sourceInode: String(stat.ino),
-    verifiedPrefix: !cooperativeCandidate && fingerprint.prefixMatches && fingerprint.complete,
+    // A complete initial snapshot is verified by definition. Cooperative
+    // append keeps the old hashes only as stale metadata and must not claim
+    // that the enlarged prefix was verified.
+    verifiedPrefix: !cooperativeCandidate
+      && fingerprint.complete
+      && (prior === null || fingerprint.prefixMatches),
     stateComplete,
     indexedTitle: indexedMeta?.indexedTitle,
     indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
@@ -895,6 +971,7 @@ export function* parse(unit: IndexUnit, _cursor: Cursor): Generator<TranscriptRe
     totalInputTokens: sm.totalInputTokens,
     totalOutputTokens: sm.totalOutputTokens,
   });
+  if (metrics) metrics.emittedRecords += out.length;
   yield* out;
   return outCursor;
 }

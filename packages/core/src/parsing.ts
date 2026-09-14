@@ -115,12 +115,13 @@ function isDir(p: string): boolean { try { return statSync(p).isDirectory(); } c
 
 interface ReadLinesOptions {
   start?: number;
+  onBytesRead?: (bytes: number) => void;
 }
 
 function readLines(
   filePath: string,
   callback: (line: string, terminated: boolean, endOffset?: number) => boolean | void,
-  { start = 0 }: ReadLinesOptions = {},
+  { start = 0, onBytesRead }: ReadLinesOptions = {},
 ): void {
   const fd = openSync(filePath, 'r');
   const bufSize = 64 * 1024;
@@ -130,6 +131,7 @@ function readLines(
   let position = start;
   try {
     while ((bytesRead = readSync(fd, buf, 0, bufSize, position)) > 0) {
+      onBytesRead?.(bytesRead);
       const chunkStart = position;
       position += bytesRead;
       const chunk = buf.subarray(0, bytesRead);
