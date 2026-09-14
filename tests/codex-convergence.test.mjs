@@ -8,12 +8,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import { appendFileSync, copyFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { persist } from '../packages/core/src/persist.ts';
 import { assembleSessionDetail } from '../packages/core/src/session-detail.ts';
-import { createCodexParseMetrics, parse } from '../packages/core/src/providers/codex.ts';
+import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
 import { makeTempDir } from './temp-dirs.mjs';
 
 const SCHEMA = readFileSync(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -142,6 +142,71 @@ test('real sanitized Codex prefix plus append converges SQLite projection', () =
   assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFull));
   dbFull.close();
   dbSplit.close();
+});
+
+test('Codex child rewritten as guardian retracts only its persisted contribution', () => {
+  const root = makeTempDir('obelisk-codex-guardian-retract-');
+  const path = join(root, 'sessions', '2026', '06', '15', 'child.jsonl');
+  mkdirSync(join(root, 'sessions', '2026', '06', '15'), { recursive: true });
+  const parentId = '019ed000-0000-7000-8000-000000000202';
+  const childId = '019ed000-0000-7000-8000-000000000203';
+  const parentSessionId = `codex:${parentId}`;
+  const childMeta = {
+    id: childId, cwd: '/tmp/codex-guardian-retract', timestamp: '2026-06-15T10:00:00Z',
+    source: { subagent: { thread_spawn: { parent_thread_id: parentId, agent_role: 'worker' } } },
+  };
+  writeJsonl(path, [
+    { type: 'session_meta', timestamp: '2026-06-15T10:00:00Z', payload: childMeta },
+    { type: 'event_msg', timestamp: '2026-06-15T10:00:01Z', payload: { type: 'user_message', message: 'child contribution' } },
+    { type: 'response_item', timestamp: '2026-06-15T10:00:02Z', payload: { type: 'function_call', call_id: 'child-call', name: 'shell', arguments: '{}' } },
+    { type: 'response_item', timestamp: '2026-06-15T10:00:03Z', payload: { type: 'function_call_output', call_id: 'child-call', output: 'child output' } },
+  ]);
+  const provider = createCodexProvider({ rootDir: root });
+  const cursorByPath = new Map();
+  const discover = () => provider.discover({ lastCursor: (key) => cursorByPath.get(key) ?? null });
+  const db = freshDb();
+  const parentUnit = { key: 'parent.jsonl', sessionId: parentSessionId, meta: { source: 'codex', guardian: false } };
+  persist(db, parentUnit, (function* () {
+    yield { kind: 'session', id: parentSessionId, title: 'parent', project: 'codex-guardian-retract', started_at: '2026-06-15T09:00:00Z', ended_at: '2026-06-15T09:00:00Z', git_branch: null, version: null, message_count: 1, countMode: 'total', jsonl_path: 'parent.jsonl', source: 'codex' };
+    yield { kind: 'message', uuid: `codex:${parentId}:000001`, session_id: parentSessionId, type: 'user', parent_uuid: null, timestamp: '2026-06-15T09:00:00Z', role: 'user', text: 'parent contribution', content_type: 'text', is_meta: 0, visibility: 'visible', model: null, is_sidechain: 0, agent_id: null, input_tokens: null, output_tokens: null, cwd: '/tmp/codex-guardian-retract', skill: null, source: 'codex' };
+    yield { kind: 'message', uuid: `codex:${parentId}:000002`, session_id: parentSessionId, type: 'assistant', parent_uuid: `codex:${parentId}:000001`, timestamp: '2026-06-15T09:00:01Z', role: 'assistant', text: null, content_type: 'tool_use', is_meta: 0, visibility: 'visible', model: null, is_sidechain: 0, agent_id: null, input_tokens: null, output_tokens: null, cwd: '/tmp/codex-guardian-retract', skill: null, source: 'codex' };
+    yield { kind: 'tool_call', id: `codex:${parentId}:parent-call`, message_uuid: `codex:${parentId}:000002`, session_id: parentSessionId, name: 'shell', presentation: 'default', input_json: '{}', file_path: null };
+    yield { kind: 'tool_result', tool_use_id: `codex:${parentId}:parent-call`, message_uuid: `codex:${parentId}:000002`, session_id: parentSessionId, content: 'parent output', file_path: null, is_error: 0 };
+  })());
+
+  const [childUnit] = discover();
+  assert.equal(childUnit.meta.guardian, false);
+  cursorByPath.set(path, persist(db, childUnit, provider.parse(childUnit, null)));
+  const childStat = statSync(path);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE agent_id=?').get(`codex:${childId}`).count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents WHERE agent_id=?').get(`codex:${childId}`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_calls WHERE id=?').get(`codex:${childId}:child-call`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_results WHERE tool_use_id=?').get(`codex:${childId}:child-call`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_calls WHERE id=?').get(`codex:${parentId}:parent-call`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_results WHERE tool_use_id=?').get(`codex:${parentId}:parent-call`).count, 1);
+
+  writeJsonl(path, [
+    { type: 'session_meta', timestamp: '2026-06-15T10:00:00Z', payload: { ...childMeta, source: { subagent: { other: 'guardian' } }, padding: 'x'.repeat(10_000) } },
+    { type: 'event_msg', timestamp: '2026-06-15T10:00:01Z', payload: { type: 'user_message', message: 'must retract' } },
+  ]);
+  const guardianStat = statSync(path);
+  assert.equal(guardianStat.ino, childStat.ino, 'rewrite retains source identity and would have qualified for the offset path');
+  assert.ok(guardianStat.size > childStat.size, 'rewrite grows the source and would have looked like an append');
+  const [guardianUnit] = discover();
+  assert.equal(guardianUnit.meta.guardian, true);
+  const metrics = createCodexParseMetrics();
+  cursorByPath.set(path, persist(db, guardianUnit, provider.parse(guardianUnit, cursorByPath.get(path), metrics)));
+  assert.equal(metrics.plan, 'snapshot', 'guardian invalidation must bypass cooperative and verified append');
+
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE agent_id=?').get(`codex:${childId}`).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM subagents WHERE agent_id=?').get(`codex:${childId}`).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_calls WHERE id=?').get(`codex:${childId}:child-call`).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_results WHERE tool_use_id=?').get(`codex:${childId}:child-call`).count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_calls WHERE id=?').get(`codex:${parentId}:parent-call`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tool_results WHERE tool_use_id=?').get(`codex:${parentId}:parent-call`).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id=? AND agent_id IS NULL').get(parentSessionId).count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE id=?').get(parentSessionId).count, 1);
+  db.close();
 });
 
 test('Codex prefix snapshot plus cooperative append converges SQLite projection', () => {

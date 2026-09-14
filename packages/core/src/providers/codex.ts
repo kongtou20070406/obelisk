@@ -513,11 +513,16 @@ export function* parse(
     && (unit.meta as { readMode?: unknown }).readMode === 'strict'
     ? 'strict'
     : 'normal';
+  // Discovery has already classified this source as a guardian. That is an
+  // explicit source invalidation, not an append: force a complete scan so the
+  // canonical guardian retraction can remove this child contribution.
+  const guardianInvalidation = unit.meta && typeof unit.meta === 'object'
+    && (unit.meta as { guardian?: unknown }).guardian === true;
   // The cooperative path deliberately trusts Codex's normal append-only writer:
   // same device/inode, a complete-line checkpoint, and monotonic growth let us
   // seek to the suffix without reading the old prefix. Any failed gate falls
   // through to #148's fingerprinted verification/snapshot behavior.
-  const cooperativeCandidate = readMode === 'normal'
+  const cooperativeCandidate = !guardianInvalidation && readMode === 'normal'
     && prior !== null
     && usableSourceIdentity(stat)
     && prior.completeLineOffset !== undefined
@@ -536,7 +541,7 @@ export function* parse(
   // Growth is the normal append signal; ctime necessarily changes when bytes
   // are appended. For same-size sources, require the unchanged ctime before
   // treating the file as a no-op, otherwise let fingerprinting detect rewrites.
-  const sameCheckpoint = cooperativeCandidate && stat.size === prior.size;
+  const sameCheckpoint = !guardianInvalidation && cooperativeCandidate && stat.size === prior.size;
   const indexedMeta = unit.meta as { indexedTitle?: string; indexedUpdatedAt?: string | null } | undefined;
   const metadataChanged = sameCheckpoint && (
     prior.indexedTitle !== indexedMeta?.indexedTitle
@@ -582,7 +587,7 @@ export function* parse(
   const afterFingerprint = statSync(unit.key);
   if ((!cooperativeAppend && (fingerprint.bytesRead !== stat.size || !sameStat(stat, afterFingerprint)))
     || (cooperativeAppend && !sameSource(stat, afterFingerprint))) return _cursor;
-  const appendCandidate = cooperativeAppend || (prior !== null
+  const appendCandidate = !guardianInvalidation && (cooperativeAppend || (prior !== null
     && prior.verifiedPrefix === true
     && prior.threadRawId === codexRawId(prior.meta.id)
     && prior.dev === String(stat.dev)
@@ -592,7 +597,7 @@ export function* parse(
     && prior.stateComplete !== false
     && prior.completeLineOffset !== undefined
     && prior.completeLineOffset === prior.size
-    && fingerprint.prefixMatches);
+    && fingerprint.prefixMatches));
   const eventMessageKeys = new Set<string>();
   const appendedEventMessageKeys = new Set<string>();
   const appendedResponseMessageKeys = new Set<string>();
@@ -705,6 +710,10 @@ export function* parse(
   const meta = checkpointMeta(rawMeta);
   const threadRawId = codexRawId(rawMeta.id) as string;
   if (codexIsGuardianThread(meta, sawAutoReviewModel ? [{ lineNum: 0, obj: { model: 'codex-auto-review' } }] : [])) {
+    // Guardian children previously contributed rows to their parent projection.
+    // `delete-session` is intentionally keyed by the child db id: persist()
+    // deletes rows where that value is `agent_id`, while preserving the shared
+    // parent session and sibling/root contributions.
     yield { kind: 'delete-session', sessionId: codexDbId(threadRawId) as string };
     return basicCursor;
   }
