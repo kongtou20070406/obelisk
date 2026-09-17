@@ -8,7 +8,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createCodexParseMetrics, createCodexProvider, parse } from '../packages/core/src/providers/codex.ts';
@@ -250,7 +250,7 @@ test('codex parse() does not publish a suffix mutated after pre-scan', () => {
   assert.equal(second.ret, first.ret);
 });
 
-test('codex parse() rejects a malformed complete line without advancing its cursor', () => {
+test('codex parse() fails closed on a malformed complete line and surfaces the freeze', () => {
   const path = writeFixture([
     { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
     { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'valid prefix' } },
@@ -258,9 +258,102 @@ test('codex parse() rejects a malformed complete line without advancing its curs
   const first = drain(parse({ key: path, sessionId: '' }, null));
   appendFileSync(path, '{not valid json}\n');
 
+  // A prior checkpoint exists: the throw surfaces the frozen source through
+  // the build's skipped-file diagnostics, and the per-unit rollback keeps the
+  // old cursor so the freeze semantics are unchanged. Typical cause: a torn
+  // write later completed by an append into a "complete but invalid" line.
+  assert.throws(
+    () => drain(parse({ key: path, sessionId: '' }, first.ret)),
+    /Malformed JSONL line: incremental indexing is frozen/,
+  );
+
+  // The source is still corrupt: every rebuild keeps surfacing the defect
+  // instead of silently skipping it.
+  assert.throws(
+    () => drain(parse({ key: path, sessionId: '' }, first.ret)),
+    /Malformed JSONL line: incremental indexing is frozen/,
+  );
+});
+
+test('codex parse() stays silent on a malformed source without a prior checkpoint', () => {
+  // Whole-snapshot builds (force rebuild, first sight) have no prior cursor:
+  // one corrupt archive file must not block the rebuild.
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'valid line' } },
+  ]);
+  appendFileSync(path, '{not valid json}\n');
+  const result = drain(parse({ key: path, sessionId: '' }, null));
+  assert.deepEqual(result.values, []);
+  assert.equal(result.ret, null, 'no checkpoint is published for a corrupt first sight');
+});
+
+test('codex parse() heals a touched-but-unchanged source instead of re-fingerprinting forever', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'stable prefix' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  const before = statSync(path);
+  // cp -p / rsync -a preserve mtime and size while ctime necessarily changes.
+  utimesSync(path, before.atime, before.mtime);
+  const touched = statSync(path);
+  assert.notEqual(touched.ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+
   const second = drain(parse({ key: path, sessionId: '' }, first.ret));
+  assert.deepEqual(second.values, [], 'a touch with no new bytes emits nothing');
+  const legs = second.ret.split(':', 6);
+  assert.equal(legs[0], `${touched.mtimeMs}`, 'the healed cursor adopts the current stat');
+  assert.equal(legs[3], `${touched.ctimeMs}`, 'the healed cursor carries the current ctime');
+  assert.equal(legs[2], first.ret.split(':', 6)[2], 'the restart offset is preserved');
+
+  // The healed signature now matches: the next build is a stable no-op
+  // instead of another full-file fingerprint pass.
+  const third = drain(parse({ key: path, sessionId: '' }, second.ret));
+  assert.deepEqual(third.values, []);
+  assert.equal(third.ret, second.ret, 'the healed cursor is a no-op checkpoint');
+});
+
+test('codex strict reconcile heals a touched-but-unchanged source', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'strict stable' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '' }, null));
+  const before = statSync(path);
+  utimesSync(path, before.atime, before.mtime);
+  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+
+  const metrics = createCodexParseMetrics();
+  const second = drain(parse({ key: path, sessionId: '', meta: { readMode: 'strict' } }, first.ret, metrics));
+  assert.equal(metrics.plan, 'verified-append', 'strict mode still verifies the prefix once');
   assert.deepEqual(second.values, []);
-  assert.equal(second.ret, first.ret);
+  assert.equal(second.ret.split(':', 6)[3], `${statSync(path).ctimeMs}`, 'strict reconcile heals the stat legs');
+
+  const third = drain(parse({ key: path, sessionId: '' }, second.ret));
+  assert.equal(third.ret, second.ret, 'the healed cursor is a no-op checkpoint afterwards');
+});
+
+test('codex parse() patches the aggregate when a touch coincides with a title change', () => {
+  const path = writeFixture([
+    { type: 'session_meta', timestamp: '2026-06-10T10:00:00Z', payload: META },
+    { type: 'event_msg', timestamp: '2026-06-10T10:00:01Z', payload: { type: 'user_message', message: 'renamed thread' } },
+  ]);
+  const first = drain(parse({ key: path, sessionId: '', meta: { indexedTitle: 'Old Title' } }, null));
+  const before = statSync(path);
+  utimesSync(path, before.atime, before.mtime);
+  assert.notEqual(statSync(path).ctimeMs, before.ctimeMs, 'the touch must change ctime for this test');
+
+  const second = drain(parse({
+    key: path, sessionId: '',
+    meta: { indexedTitle: 'New Title', indexedUpdatedAt: '2026-06-11T00:00:00Z' },
+  }, first.ret));
+  const session = second.values.find(record => record.kind === 'session');
+  assert.ok(session, 'the metadata change is patched in the healing pass');
+  assert.equal(session.title, 'New Title');
+  assert.equal(session.ended_at, '2026-06-11T00:00:00Z');
+  assert.equal(cursorState(second.ret).indexedTitle, 'New Title');
+  assert.equal(second.ret.split(':', 6)[3], `${statSync(path).ctimeMs}`, 'the cursor heals in the same pass');
 });
 
 test('codex parse() does not advance a partial tail and falls back once it is completed', () => {

@@ -186,6 +186,11 @@ const CODEX_DEDUP_BLOOM_PROBES = 6;
 // the next verification request; cooperative append still remains available.
 const CODEX_MAX_CURSOR_CHUNK_HASHES = 128;
 const CODEX_MAX_OPEN_CALLS = 4096;
+// A malformed completed JSONL line is a durable source defect: the checkpoint
+// must not advance over it. Thrown from parse() when a prior checkpoint
+// exists so the build's skipped-file diagnostics surface the frozen source;
+// whole-snapshot builds (no prior cursor) stay silent instead.
+const CODEX_MALFORMED_LINE_ERROR = 'Malformed JSONL line: incremental indexing is frozen until the source is repaired';
 
 interface CodexCursorState {
   v: number;
@@ -671,12 +676,58 @@ export function* parse(
   let scanResult = scan(appendCandidate ? prior.size : 0, appendCandidate);
   testHooks?.afterScan?.();
   const afterScan = statSync(unit.key);
-  if (!sameStat(stat, afterScan) || scanResult.malformed) return _cursor;
+  // A read-time mutation is transient: keep the old cursor and let the next
+  // build retry. A malformed completed JSONL line is a durable source defect
+  // and fails closed. With a prior checkpoint the throw surfaces the frozen
+  // source through the build's skipped-file diagnostics while the per-unit
+  // rollback preserves the old cursor; without one (force rebuild, first
+  // sight of the source) the unit stays silent so a single corrupt archive
+  // file cannot block a whole-snapshot rebuild.
+  if (!sameStat(stat, afterScan)) return _cursor;
+  if (scanResult.malformed) {
+    if (prior === null) return _cursor;
+    throw new Error(CODEX_MALFORMED_LINE_ERROR);
+  }
   const priorCompleteLineOffset = appendCandidate ? prior!.completeLineOffset! : null;
   if (priorCompleteLineOffset !== null && (afterScan.size < prior!.size || scanResult.completeLineOffset < priorCompleteLineOffset)) return _cursor;
-  // Bytes without a final newline are not a consumable append. Keep the old
-  // cursor and emit no aggregate so the next pass re-reads that partial line.
-  if (priorCompleteLineOffset !== null && scanResult.completeLineOffset === priorCompleteLineOffset) return _cursor;
+  if (priorCompleteLineOffset !== null && scanResult.completeLineOffset === priorCompleteLineOffset) {
+    // Bytes without a final newline are not a consumable append. Keep the old
+    // cursor and emit no aggregate so the next pass re-reads that partial line.
+    if (stat.size > prior!.size) return _cursor;
+    // A same-size source whose prefix fingerprint just matched changed only
+    // its stat timestamps (cp -p / rsync -a preserve mtime and size while
+    // ctime necessarily changes). Returning the old cursor would never heal:
+    // discovery keeps re-planning the unit and every build repeats the O(N)
+    // fingerprint. The verified prefix justifies refreshing the cursor's
+    // stat legs; a metadata-only change patches the aggregate exactly like
+    // the unchanged-stat no-op path above.
+    if (metrics) metrics.plan = 'verified-append';
+    const prev = prior!;
+    const { lineCount, size, ctimeMs: _ctimeMs, inode: _inode, ...state } = prev;
+    const parentRawId = metadataChanged ? codexParentThreadId(prev.meta) : null;
+    if (metadataChanged && !parentRawId) {
+      // A child has no independent session aggregate to patch (see above);
+      // it still heals its stat legs so discovery stops re-planning it.
+      const endedAt = indexedMeta?.indexedUpdatedAt && (!prev.endedAt || indexedMeta.indexedUpdatedAt > prev.endedAt)
+        ? indexedMeta.indexedUpdatedAt
+        : prev.endedAt;
+      yield {
+        kind: 'session', id: codexDbId(prev.threadRawId) as string,
+        title: prev.threadTitle ?? indexedMeta?.indexedTitle ?? null,
+        project: projectSlugFromPath(normalizeObservedCwd(prev.meta.cwd)),
+        started_at: prev.startedAt, ended_at: endedAt, git_branch: prev.gitBranch,
+        version: prev.version, message_count: prev.messageCount, countMode: 'total',
+        jsonl_path: unit.key, source: 'codex',
+      };
+      return encodeCodexCursor(stat, lineCount, size, {
+        ...state,
+        indexedTitle: indexedMeta?.indexedTitle,
+        indexedUpdatedAt: indexedMeta?.indexedUpdatedAt ?? undefined,
+        endedAt,
+      });
+    }
+    return encodeCodexCursor(stat, lineCount, size, state);
+  }
   const priorEventBloom = appendCandidate ? decodeBloom(prior.eventMessageBloom)! : emptyBloom();
   const priorResponseBloom = appendCandidate ? decodeBloom(prior.responseMessageBloom)! : emptyBloom();
   // Bloom filters have no false negatives. A possible cross-boundary duplicate
@@ -695,7 +746,8 @@ export function* parse(
     metaRecord = null;
     sawAutoReviewModel = false;
     scanResult = scan(0, false);
-    if (!sameStat(stat, statSync(unit.key)) || scanResult.malformed) return _cursor;
+    if (!sameStat(stat, statSync(unit.key))) return _cursor;
+    if (scanResult.malformed) throw new Error(CODEX_MALFORMED_LINE_ERROR);
   }
   const { lineCount: lineNum, completeLineCount, completeLineOffset, terminated } = scanResult;
   const eventMessageBloom = fast ? priorEventBloom : emptyBloom();

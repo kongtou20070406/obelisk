@@ -44,10 +44,18 @@ must not claim that its enlarged prefix was verified. Legacy cursor formats
 conservatively replay and never qualify for offset resumption.
 
 The parser stages records until source stability has been checked after scanning
-and after emitting. A mutation, malformed completed line, or invalid boundary
-returns the old cursor without yielding a mixed projection. Records and the new
-cursor commit through the existing per-unit transaction, preserving the
-at-least-once recovery contract.
+and after emitting. A read-time mutation or invalid boundary returns the old
+cursor without yielding a mixed projection. A malformed completed JSONL line
+fails closed the same way, with one distinction: when a prior checkpoint
+exists, the adapter throws so the build's per-unit skipped-file diagnostics
+surface the frozen source (the rollback preserves the old cursor); a source
+without a checkpoint — a force rebuild or a first sight — stays silent so a
+single corrupt archive file cannot block a whole-snapshot rebuild. A same-size
+source whose fingerprint just verified (a `cp -p`/`rsync -a` style touch)
+refreshes the cursor's stat legs instead of returning a cursor whose signature
+can never heal, so one verified pass — not every build — pays the O(N)
+fingerprint. Records and the new cursor commit through the existing per-unit
+transaction, preserving the at-least-once recovery contract.
 
 `meta.guardian === true` is an explicit source invalidation. It bypasses noop,
 cooperative, and verified fast paths, then performs a complete scan and emits a
@@ -63,6 +71,10 @@ session and root/sibling contributions.
 - Legacy cursor, same-mtime rewrite, replacement/truncation, partial and
   malformed tails, read-time mutation, cross-boundary dedup, bounded cursor
   state, and guardian reclassification all fail closed or converge.
+- A ctime-only touch heals the cursor signature after one verified pass and
+  becomes a no-op; a malformed-line freeze surfaces as a skipped-file
+  diagnostic on every incremental build and stays silent on whole-snapshot
+  builds; a repaired source resumes indexing and clears the freeze.
 - Convergence tests run in CI.
 - Cooperative and verified measurements use the same real-rollout append
   workload and report workload size, variation, and remaining costs honestly.
