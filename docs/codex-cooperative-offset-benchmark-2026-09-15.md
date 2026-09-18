@@ -1,5 +1,7 @@
 # Codex cooperative-offset：本机 Top 5 rollout 性能结果
 
+> **注**：本文是一次 warm-cache 单次运行的结果，未包含测量波动性与 main 基线。完整的重复采样协议、离散度统计与 main（改动前）对比见 `docs/codex-cooperative-offset-benchmark-2026-09-17.md`；本文的 "31.9×" 在该协议下修正为 cooperative vs verified 中位数比 43–67×、cooperative vs main 中位数比 240–481×。
+
 - **日期**：2026-09-15
 - **输入**：本机按文件大小排序的前 5 个真实 Codex rollout；输入仅被复制到系统临时目录进行测试，未上传、未加入 Git，也未在本文记录路径、文件名、thread id 或内容。
 - **负载**：每个输入先完整 index 一次；随后追加相同的 262 B 完整 JSONL 行，并各跑一次 cooperative 与 strict（verified）增量 index。
