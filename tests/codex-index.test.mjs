@@ -225,3 +225,37 @@ test('codex incremental build surfaces a frozen malformed rollout and resumes af
   assert.equal(c.msgs, 3, 'a repaired rollout resumes indexing');
   assert.equal(c.hits, 1, 'the repaired append is searchable');
 });
+
+// RFC #172: the CLI's pre-query refresh is a full-inventory pass and, for a
+// CLI-only user, their reconciliation — there is no watcher to reconcile
+// against. It must select strict read mode, so an append is verified rather
+// than trusted: a cooperative append would clear verifiedPrefix on the stored
+// cursor, a verified append keeps it true.
+test('codex CLI query refresh verifies prefixes instead of trusting cooperative appends', () => {
+  const home = makeTempDir('obelisk-codex-cli-strict-');
+  const dir = join(home, '.codex', 'sessions', '2026', '06', '15');
+  mkdirSync(dir, { recursive: true });
+  const jsonl = join(dir, `rollout-2026-06-15T10-00-00-${ID}.jsonl`);
+
+  writeFileSync(jsonl, [metaLine(), evt('user_message', 'codex hello', '2026-06-15T10:00:01Z')].join('\n') + '\n');
+  assert.equal(runRuntime(['--build'], home).status, 0);
+
+  const cursorState = () => {
+    const db = new DatabaseSync(join(home, '.obelisk', 'obelisk.sqlite'));
+    try {
+      const cursor = db.prepare('SELECT cursor FROM index_state WHERE jsonl_path = ?').get(jsonl)?.cursor;
+      assert.ok(typeof cursor === 'string' && cursor.length > 0, 'a provider cursor is stored for the rollout');
+      return JSON.parse(Buffer.from(cursor.split(':', 6)[5], 'base64url').toString('utf8'));
+    } finally {
+      db.close();
+    }
+  };
+  assert.equal(cursorState().verifiedPrefix, true, 'the force snapshot establishes a verified cursor');
+
+  appendFileSync(jsonl, evt('user_message', 'codex followup', '2026-06-15T10:01:00Z') + '\n');
+  clearDebounce(home);
+  const c = codexCounts(home); // --query triggers the pre-query refresh build
+  assert.equal(c.msgs, 2, 'the appended message is indexed by the refresh');
+  assert.equal(c.hits, 1, 'the appended message is searchable');
+  assert.equal(cursorState().verifiedPrefix, true, 'the CLI refresh takes verified append, not cooperative');
+});

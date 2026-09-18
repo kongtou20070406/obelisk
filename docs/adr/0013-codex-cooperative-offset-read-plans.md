@@ -30,10 +30,14 @@ selection, cursor interpretation, and all source-specific invariants.
 | `verified-append` | Strict mode, or cooperative is unavailable; a bounded completed-prefix fingerprint and continuation state validate | `O(N + delta)` | Reread/hash the prefix before projecting the suffix. |
 | `snapshot` | Fresh, legacy, or incomplete cursor; replacement/truncation; failed offset/identity/fingerprint gate; cross-boundary dedup ambiguity; guardian invalidation; or a read-time validation failure | `O(N)` | Rebuild canonical, deduplication, and continuation state from the source. |
 
-`normal` is the ordinary watcher/indexing mode. `strict` is used by
-reconciliation and repair, and explicitly disables cooperative append. A full
-snapshot remains the canonical truth and repair mechanism; cooperative append
-is a performance optimization, not a source-integrity proof.
+`normal` is the ordinary watcher/event-driven indexing mode. `strict` is
+verification mode — used by reconciliation and repair, and by any full-inventory
+refresh that acts as its caller's reconciliation (the app's periodic
+reconcile/repair and the CLI's pre-query refresh and invocation-nonce recovery:
+a CLI-only user has no watcher, so that refresh is their reconciliation). It
+explicitly disables cooperative append. A full snapshot remains the canonical
+truth and repair mechanism; cooperative append is a performance optimization,
+not a source-integrity proof.
 
 The v4 cursor stores a complete-line restart boundary (`completeLineOffset` and
 `sourceSize`), source identity (`mtime`, `ctime`, `dev`, inode), bounded prefix
@@ -79,8 +83,10 @@ session and root/sibling contributions.
 - Cooperative and verified measurements use the same real-rollout append
   workload and report workload size, variation, and remaining costs honestly.
 
-**Consequences.** Callers retain a small interface: ordinary indexing asks for
-normal mode and repair/reconciliation asks for strict mode. The Codex adapter
+**Consequences.** Callers retain a small interface: watcher/event-driven
+indexing asks for normal mode, while repair, reconciliation, and
+full-inventory refreshes that act as their caller's reconciliation (the CLI's
+pre-query refresh and nonce recovery) ask for strict mode. The Codex adapter
 contains the complex selector and recovery rules, preserving locality. Future
 providers do not inherit the cooperative assumption; each provider must make
 its own source and cursor guarantees. The remaining rollout decision—whether
