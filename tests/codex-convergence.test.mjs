@@ -122,7 +122,13 @@ test('real sanitized Codex output round-trips through SQLite', () => {
   db.close();
 });
 
-test('real sanitized Codex prefix plus append converges SQLite projection', () => {
+// The sanitized real fixture uses differentiated placeholders (the same
+// original string always maps to the same placeholder, a different string to
+// a different one), so the duplicate-pair structure survives sanitization.
+// Regenerate with scripts/sanitize-codex-fixture.mjs. Line 60 splits no
+// duplicate pair, so the incremental pass must take the cooperative fast
+// path — not merely "some plan" — and read only the appended suffix.
+test('real sanitized Codex prefix plus append takes the cooperative fast path and converges', () => {
   const fullPath = join(makeTempDir('obelisk-codex-real-full-'), 'rollout.jsonl');
   copyFileSync(REAL_FIXTURE, fullPath);
   const dbFull = freshDb();
@@ -133,12 +139,42 @@ test('real sanitized Codex prefix plus append converges SQLite projection', () =
   const dbSplit = freshDb();
   const prefixUnit = { key: path, sessionId: '', meta: { source: 'codex', guardian: false } };
   const cursor = persist(dbSplit, prefixUnit, parse(prefixUnit, null));
-  const complete = readFileSync(REAL_FIXTURE, 'utf8').split('\n');
-  appendFileSync(path, `${complete.slice(60).filter(Boolean).join('\n')}\n`);
+  const suffixLines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').slice(60).filter(Boolean);
+  const suffixBytes = Buffer.byteLength(`${suffixLines.join('\n')}\n`);
+  appendFileSync(path, `${suffixLines.join('\n')}\n`);
   const metrics = createCodexParseMetrics();
   persist(dbSplit, { key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, parse({ key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, cursor, metrics));
 
-  assert.notEqual(metrics.plan, null);
+  assert.equal(metrics.plan, 'cooperative-append', 'a real-shaped append must engage the fast path, not silently degrade to snapshot');
+  assert.equal(metrics.suffixBytesRead, suffixBytes * 2, 'pre-scan and emit each read the suffix once');
+  assert.ok(metrics.sourceBytesRead <= suffixBytes * 2, 'cooperative source reads only the two suffix passes');
+  assert.equal(metrics.jsonLinesParsed, suffixLines.length * 2, 'only suffix records are parsed in pre-scan and emit');
+  assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFull));
+  dbFull.close();
+  dbSplit.close();
+});
+
+// Line 64 splits a real duplicate pair (an assistant message whose two
+// representations land on opposite sides of the boundary), so the
+// cross-boundary Bloom check must conservatively select the snapshot path —
+// and still converge to the same projection.
+test('real sanitized Codex split straddling a duplicate pair falls back to snapshot and converges', () => {
+  const lines = readFileSync(REAL_FIXTURE, 'utf8').split('\n').filter(Boolean);
+  const fullPath = join(makeTempDir('obelisk-codex-real-straddle-full-'), 'rollout.jsonl');
+  writeFileSync(fullPath, `${lines.join('\n')}\n`);
+  const dbFull = freshDb();
+  persist(dbFull, { key: fullPath, sessionId: '', meta: { source: 'codex', guardian: false } }, parse({ key: fullPath, sessionId: '', meta: { source: 'codex', guardian: false } }, null));
+
+  const path = join(makeTempDir('obelisk-codex-real-straddle-split-'), 'rollout.jsonl');
+  writeFileSync(path, `${lines.slice(0, 64).join('\n')}\n`);
+  const dbSplit = freshDb();
+  const prefixUnit = { key: path, sessionId: '', meta: { source: 'codex', guardian: false } };
+  const cursor = persist(dbSplit, prefixUnit, parse(prefixUnit, null));
+  appendFileSync(path, `${lines.slice(64).join('\n')}\n`);
+  const metrics = createCodexParseMetrics();
+  persist(dbSplit, { key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, parse({ key: path, sessionId: '', meta: { source: 'codex', guardian: false } }, cursor, metrics));
+
+  assert.equal(metrics.plan, 'snapshot', 'a straddled duplicate pair must fall back to the exact full replay');
   assert.deepEqual(dumpDb(dbSplit), dumpDb(dbFull));
   dbFull.close();
   dbSplit.close();
