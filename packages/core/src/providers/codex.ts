@@ -232,7 +232,11 @@ interface DecodedCodexCursor extends CodexCursorState {
   inode: number;
 }
 
-/** Test/benchmark-only observation of source work for one parse invocation. */
+/**
+ * Test/benchmark-only observation of source work for one parse invocation.
+ * Codex-local by design: ADR-0013 records the trigger (a second provider
+ * needing parse observability) for lifting this into a shared contract.
+ */
 export interface CodexParseMetrics {
   sourceBytesRead: number;
   suffixBytesRead: number;

@@ -89,7 +89,13 @@ full-inventory refreshes that act as their caller's reconciliation (the CLI's
 pre-query refresh and nonce recovery) ask for strict mode. The Codex adapter
 contains the complex selector and recovery rules, preserving locality. Future
 providers do not inherit the cooperative assumption; each provider must make
-its own source and cursor guarantees. The remaining rollout decision—whether
-normal-mode cooperative append needs an explicit feature flag—remains open in
-RFC issue #172; cold-cache and repeated-sample performance evidence are also
-not settled by this ADR.
+its own source and cursor guarantees. The parse-observability probe
+(`CodexParseMetrics`/`CodexParseTestHooks`, optional parameters used only by
+tests and benchmarks; production callers pass the two-argument contract) is
+likewise deliberately Codex-local: it should be lifted into a provider-neutral
+observer on the shared provider contract only when a second provider actually
+needs parse observability, with its shape defined from at least two real
+consumers rather than extrapolated from Codex alone. The remaining rollout
+decision—whether normal-mode cooperative append needs an explicit feature
+flag—remains open in RFC issue #172; cold-cache and repeated-sample
+performance evidence are also not settled by this ADR.
