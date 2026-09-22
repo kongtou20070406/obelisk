@@ -29,6 +29,8 @@ export interface ProviderInventoryIssue extends InventoryIssue {
   readonly provider: string;
 }
 
+export type ProviderReadMode = 'normal' | 'strict';
+
 export interface ProviderIndexPlan {
   readonly items: ProviderIndexItem[];
   readonly pendingMarkers: ReadonlyMap<string, string>;
@@ -186,10 +188,12 @@ export function createProviderIndexPlan(
     force = false,
     changedPaths,
     priorSessions,
+    readMode = 'normal',
   }: {
     force?: boolean;
     changedPaths?: string[];
     priorSessions?: readonly ProviderSessionProvenance[];
+    readMode?: ProviderReadMode;
   } = {},
 ): ProviderIndexPlan {
   const items: ProviderIndexItem[] = [];
@@ -243,7 +247,15 @@ export function createProviderIndexPlan(
     for (const unit of units) {
       items.push({
         provider,
-        unit,
+        unit: readMode === 'normal'
+          ? unit
+          : {
+            ...unit,
+            meta: {
+              ...(unit.meta && typeof unit.meta === 'object' ? unit.meta : {}),
+              readMode,
+            },
+          },
         cursor: fullReindex ? null : storedProviderCursor(db, unit.key),
       });
     }
@@ -270,13 +282,30 @@ export function indexProviderPlan({
   const committed: ProviderIndexItem[] = [];
   const failedProviders = new Set<string>();
   const failedItems: ProviderIndexItem[] = [];
+  let replayScheduleCommitted = plan.pendingMarkers.size === 0 && plan.replayKeys.size === 0;
   for (const item of plan.items) {
     try {
       const cursor = runTransaction(`provider:${item.provider.name}:${item.unit.key}`, () => {
+        // Commit the replay schedule with its first completed unit. After an
+        // interruption, newly written cursors identify exactly what can resume.
+        if (!replayScheduleCommitted) {
+          const clear = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
+          const keysToReplay = new Set(
+            plan.items
+              .filter(({ provider }) => plan.pendingMarkers.has(provider.name))
+              .map(({ unit }) => unit.key),
+          );
+          for (const keys of plan.replayKeys.values()) {
+            for (const key of keys) keysToReplay.add(key);
+          }
+          for (const key of keysToReplay) clear.run(key);
+          writePendingMarkers(db, plan);
+        }
         const nextCursor = persist(db, item.unit, item.provider.parse(item.unit, item.cursor));
         onPersisted(item, nextCursor);
         return nextCursor;
       });
+      replayScheduleCommitted = true;
       committed.push(item);
       onCommitted(item, cursor);
     } catch (error) {
@@ -325,6 +354,15 @@ export function indexProviderPlanStrict({
   });
 }
 
+/** Write every pending version marker, so the first-unit transaction and finalize share one marker row shape. */
+function writePendingMarkers(db: SqliteDb, plan: ProviderIndexPlan): void {
+  const write = db.prepare(
+    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
+  );
+  const now = Date.now();
+  for (const marker of plan.pendingMarkers.values()) write.run(marker, now);
+}
+
 export function writeProviderIndexMarkers(
   db: SqliteDb,
   plan: ProviderIndexPlan,
@@ -332,9 +370,6 @@ export function writeProviderIndexMarkers(
 ): void {
   if (result.stopped !== undefined) return;
   const retry = db.prepare('DELETE FROM index_state WHERE jsonl_path = ?');
-  const write = db.prepare(
-    'INSERT OR REPLACE INTO index_state (jsonl_path, mtime, lines_processed) VALUES (?, ?, 0)',
-  );
   const committed = new Set(result.committed.map(
     (item) => `${item.provider.name}\0${item.unit.key}`,
   ));
@@ -349,7 +384,5 @@ export function writeProviderIndexMarkers(
   for (const item of result.failedItems) {
     if (plan.pendingMarkers.has(item.provider.name)) retry.run(item.unit.key);
   }
-  for (const marker of plan.pendingMarkers.values()) {
-    write.run(marker, Date.now());
-  }
+  writePendingMarkers(db, plan);
 }

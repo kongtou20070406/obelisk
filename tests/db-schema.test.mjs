@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { extractContentType, extractMessageIsMeta } from '../packages/core/src/db.ts';
 import { migrateCoreSchemaColumns } from '../packages/core/src/schema-migrations.ts';
+import { createQueryApi } from '../packages/core/src/query.ts';
 
 async function readExecutableSchema() {
   return readFile(new URL('../packages/core/src/schema.sql', import.meta.url), 'utf8');
@@ -156,6 +157,43 @@ test('tool results schema limits failure scans to failure rows', async () => {
   }
 });
 
+test('failure index preserves NULL-source compatibility and visibility in the production helper', async () => {
+  const schema = await readExecutableSchema();
+  const outputs = [];
+  for (const indexed of [false, true]) {
+    const db = new DatabaseSync(':memory:');
+    try {
+      db.exec(schema);
+      if (!indexed) db.exec('DROP INDEX idx_tr_failure_session');
+      db.exec(`
+        INSERT INTO sessions (id, source) VALUES ('legacy', NULL), ('codex', 'codex');
+        INSERT INTO messages (uuid, session_id, timestamp, visibility) VALUES
+          ('visible', 'legacy', '2026-09-01T00:00:00.000Z', 'visible'),
+          ('inactive', 'legacy', '2026-09-02T00:00:00.000Z', 'inactive'),
+          ('hidden', 'legacy', '2026-09-03T00:00:00.000Z', 'hidden');
+        INSERT INTO tool_results (tool_use_id, session_id, message_uuid, content, is_error) VALUES
+          ('null-source', 'legacy', 'visible', 'failed', 1),
+          ('missing-session', 'absent', NULL, 'Exit code 1', 0),
+          ('codex-error', 'codex', NULL, 'failed', 1),
+          ('inactive-error', 'legacy', 'inactive', 'failed', 1),
+          ('hidden-error', 'legacy', 'hidden', 'failed', 1),
+          ('success', 'legacy', 'visible', 'ok', 0);
+      `);
+      const api = createQueryApi(db);
+      const ids = opts => api.failures(opts).map(row => row.result.tool_use_id);
+      assert.deepEqual(ids({ source: 'claude' }), ['null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'codex' }), ['codex-error']);
+      assert.deepEqual(ids({ source: 'claude', includeInactive: true }),
+        ['inactive-error', 'null-source', 'missing-session']);
+      assert.deepEqual(ids({ source: 'claude', sessionId: 'legacy', limit: 1 }), ['null-source']);
+      outputs.push(api.failures({ source: 'claude', includeInactive: true }));
+    } finally {
+      db.close();
+    }
+  }
+  assert.deepEqual(outputs[1], outputs[0], 'adding the index must not change returned evidence');
+});
+
 test('session detail queries use the visible main timeline index', async () => {
   const db = new DatabaseSync(':memory:');
   try {
@@ -262,9 +300,9 @@ test('schema reference stays focused on raw SQL structure', async () => {
 
   assert.ok(ref.split('\n').length < 420, 'schema.md should remain a quick SQL reference');
   assert.match(ref, /Raw SQL Quick Reference/i);
-  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, and Pi/);
+  assert.match(ref, /Claude Code, Codex, DeepSeek Harness, Kimi Code, OMP, and Pi/);
   assert.equal(
-    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, or `pi`/g)?.length,
+    ref.match(/Provider ID: `claude`, `codex`, `deepseek`, `kimi`, `omp`, or `pi`/g)?.length,
     2,
     'session and message source fields should document every provider',
   );
@@ -282,7 +320,7 @@ test('api reference documents query helpers and current return fields', async ()
   const ref = await readApiReference();
 
   assert.match(ref, /## Query API Reference/);
-  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'pi'/);
+  assert.match(ref, /'claude' \| 'codex' \| 'deepseek' \| 'kimi' \| 'omp' \| 'pi'/);
   assert.doesNotMatch(ref, /"claude", "codex", or omitted/);
   assert.match(ref, /#### `summaries\(opts\?\)`/);
   assert.match(ref, /summary rows/i);
@@ -302,8 +340,10 @@ test('api reference documents query helpers and current return fields', async ()
 test('skill routes agents to the right reference document', async () => {
   const skill = await readSkill();
 
-  assert.match(skill, /Claude Code, Codex, Kimi Code, and Pi/);
-  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'pi'/s);
+  assert.match(skill, /Claude Code, Codex, Kimi Code, OMP, and Pi/);
+  assert.match(skill, /'claude'.*'codex'.*'deepseek'.*'kimi'.*'omp'.*'pi'/s);
+  assert.match(skill, /Pi and OMP can preserve.*visibility='inactive'/s);
+  assert.match(skill, /while working on X, did we discuss Y\?.*locate sessions from X first/s);
   assert.match(skill, /Reference Map/);
   assert.match(skill, /references\/schema\.md.*raw SQL/i);
   assert.match(skill, /references\/api-reference\.md.*helper/i);
